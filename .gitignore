@@ -1,0 +1,40 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints / outputs / logs
+checkpoints/
+output/
+outputs/
+eval_runs/
+runs/
+logs/
+wandb/
+lightning_logs/
+tensorboard/
+
+# Data / artifacts
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.zip
+*.tar
+*.tar.gz
+
+# Local envs
+.env
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Local papers
+2412.06777v1.pdf

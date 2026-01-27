@@ -25,6 +25,7 @@ def get_args_parser():
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
     parser.add_argument('--resolution', required=True, type=int, help="resolution")
     parser.add_argument('--sequence_length', required=True, type=int, help="sequence_length")
+    parser.add_argument('--max_batches', type=int, default=0, help="limit number of batches for quick eval (0=full)")
     return parser
 
 @torch.no_grad()
@@ -37,13 +38,18 @@ def main(args):
         
     # Load model
     model = Spann3R(dus3r_name='./checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth', 
-                use_feat=False).to(args.device)
-    
-    model.load_state_dict(torch.load(args.ckpt_path)['model'])
+                use_feat=False)
+    ckpt = torch.load(args.ckpt_path, map_location='cpu')
+    model.load_state_dict(ckpt['model'])
+    model = model.to(args.device)
     model.eval()
 
     criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
     dataloader = build_dataset(args.dataset, batch_size=1, num_workers=0, test=True)
+    dataset = dataloader.dataset
+    cams = getattr(dataset, "cams", None)
+    if not cams:
+        cams = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
 
     acc_all = 0
     acc_all_med = 0
@@ -59,12 +65,19 @@ def main(args):
     delta_1_25_all = 0
     delta_1_25_2_all = 0
     total_sequences = 0
+    valid_sequences = 0
 
     for batch_id, batch in tqdm.tqdm(enumerate(dataloader)):
+        if args.max_batches and batch_id >= args.max_batches:
+            break
         
         batch_outputs = {}
-        scene_id = batch_id // len(cams) + 1
-        cam = cams[batch_id % len(cams)]   
+        if len(cams) > 0:
+            scene_id = batch_id // len(cams) + 1
+            cam = cams[batch_id % len(cams)]
+        else:
+            scene_id = batch_id + 1
+            cam = "cam"
 
         ##### Inference
         for view in batch:
@@ -76,7 +89,8 @@ def main(args):
 
             left_preds, left_preds_all = model.forward(left_batch)
             right_preds, right_preds_all = model.forward(right_batch)
-            cam = cams[batch_id % len(cams)]
+            if len(cams) > 0:
+                cam = cams[batch_id % len(cams)]
             batch_outputs[cam] = {
                 'left': {
                     'inputs': left_batch,
@@ -94,7 +108,8 @@ def main(args):
 
         elif len(batch) == sequence_length:
             preds, preds_all = model.forward(batch)
-            cam = cams[batch_id % len(cams)]
+            if len(cams) > 0:
+                cam = cams[batch_id % len(cams)]
             batch_outputs[cam] = {
                 'single': {
                     'inputs': batch,
@@ -115,7 +130,10 @@ def main(args):
             preds_all = batch_outputs[cam][split]['preds_all']
 
             # load lidar point
-            batch = NuSceneDataset.load_lidar_pts(inputs)
+            if hasattr(dataset, "load_lidar_pts"):
+                batch = dataset.load_lidar_pts(inputs, image_size=(args.resolution, args.resolution))
+            else:
+                batch = NuSceneDataset.load_lidar_pts(inputs)
             for view in batch:
                 for item in view:
                     if isinstance(view[item], torch.Tensor):
@@ -149,18 +167,25 @@ def main(args):
 
                 #### Align predicted 3D points to the ground truth 
                 pts[..., -1] += gt_shift_z.cpu().numpy().item()
-                depth_pred = pts[..., -1][mask]             
+                depth_pred = pts[..., -1][mask]
                 pts = geotrf(in_camera1, pts)
                 
                 pts_gt[..., -1] += gt_shift_z.cpu().numpy().item()
                 depth_gt = pts_gt[..., -1][mask]
                 pts_gt = geotrf(in_camera1, pts_gt)
 
-                abs_rel += np.mean(np.abs(depth_pred - depth_gt) / depth_gt)
-                sq_rel += np.mean(((depth_pred - depth_gt) / depth_gt) ** 2)
-                rmse += np.sqrt(np.mean((depth_pred - depth_gt) ** 2))
-                delta_1_25 += np.mean(np.maximum(depth_pred / depth_gt, depth_gt / depth_pred) < 1.25)
-                delta_1_25_2 += np.mean(np.maximum(depth_pred / depth_gt, depth_gt / depth_pred) < 1.5625)         
+                valid_depth = (
+                    np.isfinite(depth_pred) & np.isfinite(depth_gt) &
+                    (depth_gt > 1e-6) & (depth_pred > 1e-6)
+                )
+                if np.any(valid_depth):
+                    dp = depth_pred[valid_depth]
+                    dg = depth_gt[valid_depth]
+                    abs_rel += np.mean(np.abs(dp - dg) / dg)
+                    sq_rel += np.mean(((dp - dg) / dg) ** 2)
+                    rmse += np.sqrt(np.mean((dp - dg) ** 2))
+                    delta_1_25 += np.mean(np.maximum(dp / dg, dg / dp) < 1.25)
+                    delta_1_25_2 += np.mean(np.maximum(dp / dg, dg / dp) < 1.5625)
 
                 images_all.append((image[None, ...] + 1.0)/2.0)
                 pts_all.append(pts[None, ...])
@@ -185,12 +210,25 @@ def main(args):
             images_all_masked = images_all
             pts_gt_all_masked = pts_gt_all[masks_all > 0]
 
+            pred_pts = pts_all_masked.reshape(-1, 3)
+            pred_colors = images_all_masked.reshape(-1, 3)
+            pred_mask = np.isfinite(pred_pts).all(axis=1)
+            pred_pts = pred_pts[pred_mask]
+            pred_colors = pred_colors[pred_mask]
+
+            gt_pts = pts_gt_all_masked.reshape(-1, 3)
+            gt_mask = np.isfinite(gt_pts).all(axis=1)
+            gt_pts = gt_pts[gt_mask]
+
+            if pred_pts.size == 0 or gt_pts.size == 0:
+                continue
+
             pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts_all_masked.reshape(-1, 3))
-            pcd.colors = o3d.utility.Vector3dVector(images_all_masked.reshape(-1, 3))
+            pcd.points = o3d.utility.Vector3dVector(pred_pts)
+            pcd.colors = o3d.utility.Vector3dVector(pred_colors)
     
             pcd_gt = o3d.geometry.PointCloud()
-            pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all_masked.reshape(-1, 3))
+            pcd_gt.points = o3d.utility.Vector3dVector(gt_pts)
 
             trans_init = np.eye(4)
             reg_p2p = o3d.pipelines.registration.registration_icp(
@@ -224,20 +262,22 @@ def main(args):
             rmse_all += rmse
             delta_1_25_all += delta_1_25
             delta_1_25_2_all += delta_1_25_2
+            valid_sequences += 1
 
-    print('accuracy', acc_all / total_sequences)
-    print('completion', comp_all / total_sequences)
-    print('nc1', nc1_all / total_sequences)
-    print('nc2', nc2_all / total_sequences)
-    print('acc_med', acc_all_med / total_sequences)
-    print('comp_med', comp_all_med / total_sequences)
-    print('nc1_med', nc1_all_med / total_sequences)
-    print('nc2_med', nc2_all_med / total_sequences)
-    print('abs_rel', abs_rel_all / total_sequences)
-    print('sq_rel', sq_rel_all / total_sequences)
-    print('rmse', rmse_all / total_sequences)
-    print('delta_1_25', delta_1_25_all / total_sequences)
-    print('delta_1_25_2', delta_1_25_2_all / total_sequences)
+    denom = max(valid_sequences, 1)
+    print('accuracy', acc_all / denom)
+    print('completion', comp_all / denom)
+    print('nc1', nc1_all / denom)
+    print('nc2', nc2_all / denom)
+    print('acc_med', acc_all_med / denom)
+    print('comp_med', comp_all_med / denom)
+    print('nc1_med', nc1_all_med / denom)
+    print('nc2_med', nc2_all_med / denom)
+    print('abs_rel', abs_rel_all / denom)
+    print('sq_rel', sq_rel_all / denom)
+    print('rmse', rmse_all / denom)
+    print('delta_1_25', delta_1_25_all / denom)
+    print('delta_1_25_2', delta_1_25_2_all / denom)
         
 if __name__ == '__main__':
     parser = get_args_parser()

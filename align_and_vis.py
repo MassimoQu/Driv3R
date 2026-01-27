@@ -12,6 +12,7 @@ import torchvision
 from torch.utils.data import DataLoader
 
 from dust3r.losses import L21
+from dust3r.utils.geometry import geotrf
 from driv3r.datasets import *
 from driv3r.model import Spann3R
 from driv3r.loss import Regr3D_t_ScaleShiftInv
@@ -25,7 +26,9 @@ def get_args_parser():
     parser.add_argument('--ckpt_path', type=str, default='./checkpoints/driv3r.pth', help='ckpt path')
     parser.add_argument('--device', type=str, default='cuda:0', help='device')
     parser.add_argument('--scale', type=int, default=120, help="point scale")
-    parser.add_argument('--conf_thresh', type=float, default=1.001, help='confidence threshold')
+    parser.add_argument('--conf_thresh', type=float, default=3.0, help='Keep pixels with conf >= threshold (higher is higher confidence).')
+    parser.add_argument('--sky_top_ratio', type=float, default=0.0, help="Drop top fraction of pixels (approx sky). 0 disables.")
+    parser.add_argument('--max_batches', type=int, default=0, help='limit batches for quick visualization (0=all)')
 
     return parser
 
@@ -49,9 +52,15 @@ def main(args):
     # dataloader
     criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
     dataloader = build_dataset(args.dataset, batch_size=1, num_workers=0, test=True)
+    dataset = dataloader.dataset
+    cams = getattr(dataset, "cams", None)
+    if not cams:
+        cams = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
 
     batch_outputs = {}
     for batch_id, batch in tqdm.tqdm(enumerate(dataloader)):
+        if args.max_batches and batch_id >= args.max_batches:
+            break
 
         scene_id = batch_id // len(cams) + 1
         os.makedirs(os.path.join(save_dir, f'scene_{str(scene_id)}'), exist_ok=True)
@@ -105,7 +114,10 @@ def main(args):
                     preds_all = batch_outputs[cam][split]['preds_all']
 
                     # load lidar point
-                    batch = NuSceneDataset.load_lidar_pts(inputs)
+                    if hasattr(dataset, "load_lidar_pts"):
+                        batch = dataset.load_lidar_pts(inputs)
+                    else:
+                        batch = NuSceneDataset.load_lidar_pts(inputs)
                     for view in batch:
                         for item in view:
                             if isinstance(view[item], torch.Tensor):
@@ -132,38 +144,28 @@ def main(args):
                         
                         image = view['img'].permute(0, 2, 3, 1).cpu().numpy()[0]
                         mask = view['valid_mask'].cpu().numpy()[0]
-                        pts = pred_pts[0][j].cpu().numpy()[0] if j < len(pred_pts[0]) else pred_pts[1][-1].cpu().numpy()[0]
                         conf = preds[j]['conf'][0].cpu().data.numpy()
-                        K = view['camera_intrinsics'][0].cpu().numpy()
-                        extrinsic = view['camera_pose'][0].cpu().numpy()
+                        # Predictions from criterion are in the coordinate system of the first frame (camera1).
+                        extrinsic = in_camera1.cpu().numpy()
                         
-                        depth_pred = pts[..., -1]
-                        depth_pred = (depth_pred - np.min(depth_pred)) / (np.max(depth_pred) - np.min(depth_pred))
+                        pts = pred_pts[0][j].cpu().numpy()[0] if j < len(pred_pts[0]) else pred_pts[1][-1].cpu().numpy()[0]
+                        # Restore shift (align with eval.py) and transform to world.
+                        pts[..., -1] += gt_shift_z.cpu().numpy().item()
+                        world_coords = geotrf(extrinsic, pts)
 
-                        pts_lidar = view['pts3d'][0].cpu().numpy()[mask]
-                        N = pts_lidar.shape[0]
-                        pts_lidar_homo = np.concatenate([pts_lidar, np.ones((N, 1), dtype=np.float32)], axis=-1)
-                        pts_gt_c = (np.linalg.inv(extrinsic) @ pts_lidar_homo.T).T
-                        shift = np.min(pts_gt_c[..., 2])
+                        image = ((image + 1.0) / 2.0)
+                        conf_mask = conf >= args.conf_thresh if args.conf_thresh is not None else np.ones_like(conf, dtype=bool)
+                        finite_mask = np.isfinite(world_coords).all(axis=-1)
+                        keep = conf_mask & finite_mask
+                        if args.sky_top_ratio and float(args.sky_top_ratio) > 0:
+                            h, w = keep.shape[:2]
+                            sky_h = int(round(h * float(args.sky_top_ratio)))
+                            if sky_h > 0:
+                                keep[:sky_h, :] = False
 
-                        depth_pred = depth_pred * scale + shift
-                        depth_pred = depth_pred.reshape(-1)[:, np.newaxis]
-                        image = ((image + 1.0) / 2.0).reshape(-1, 3)
-
-                        u, v = np.meshgrid(np.arange(W), np.arange(H))
-                        pixel_coords = np.stack([u, v, np.ones_like(u)], axis=-1)
-
-                        K_inv = np.linalg.inv(K)
-                        depth_values = depth_pred.reshape(-1)  # (H * W,)
-                        pixel_coords_3d = pixel_coords.reshape(-1, 3)  # (H * W, 3)
-                        camera_coords = (K_inv @ pixel_coords_3d.T).T * depth_values[:, np.newaxis]  # (H * W, 3)
-                        extrinsic_rotation = extrinsic[:3, :3]  # (3, 3)
-                        extrinsic_translation = extrinsic[:3, 3]  # (3,)
-                        world_coords = camera_coords @ extrinsic_rotation.T + extrinsic_translation
-                        
                         images_all.append(image[None, ...])
                         pts_all.append(world_coords[None, ...])
-                        masks_all.append(mask[None, ...])
+                        masks_all.append(keep[None, ...])
                         conf_all.append(conf[None, ...])
 
                         if per_frame:
@@ -176,9 +178,9 @@ def main(args):
                     masks_all = np.concatenate(masks_all, axis=0)
                     conf_all = np.concatenate(conf_all, axis=0)
 
-                    all_points.append(pts_all.reshape(-1, 3))
-                    all_colors.append(images_all.reshape(-1, 3))
-                    all_confs.append(conf_all.reshape(-1))
+                    all_points.append(pts_all[masks_all].reshape(-1, 3))
+                    all_colors.append(images_all[masks_all].reshape(-1, 3))
+                    all_confs.append(conf_all[masks_all].reshape(-1))
             
             all_points = np.concatenate(all_points, axis=0)
             all_colors = np.concatenate(all_colors, axis=0)

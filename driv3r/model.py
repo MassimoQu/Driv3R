@@ -1,4 +1,5 @@
 import copy
+import os
 import torch
 import numpy as np
 import torch.nn as nn
@@ -211,7 +212,24 @@ class Spann3R(nn.Module):
         self.mem_pos_enc = mem_pos_enc
 
         # DUSt3R
-        self.dust3r = AsymmetricCroCo3DStereo.from_pretrained(dus3r_name, landscape_only=True)
+        min_ckpt_size = 1_500_000_000  # ~1.5GB safety check for ViT-L checkpoint
+        if dus3r_name and os.path.isfile(dus3r_name) and os.path.getsize(dus3r_name) > min_ckpt_size:
+            self.dust3r = AsymmetricCroCo3DStereo.from_pretrained(dus3r_name, landscape_only=True)
+        else:
+            # Fallback to ViT-L config when the DUSt3R checkpoint is missing.
+            self.dust3r = AsymmetricCroCo3DStereo(
+                landscape_only=True,
+                img_size=(224, 224),
+                patch_size=16,
+                enc_embed_dim=1024,
+                enc_depth=24,
+                enc_num_heads=16,
+                dec_embed_dim=768,
+                dec_depth=12,
+                dec_num_heads=12,
+                head_type="dpt",
+                pos_embed="RoPE100",
+            )
 
         # Memory encoder
         self.set_memory_encoder(enc_embed_dim=768 if use_feat else 1024, memory_dropout=memory_dropout) 
@@ -458,11 +476,17 @@ class Spann3R(nn.Module):
         
         return preds, preds_all, idx_used
     
-    def forward(self, frames, return_memory=False):
+    def forward(self, frames, return_memory=False, mem_sim_thresh: float | None = None):
         if self.training:
             sp_mem = SpatialTemporalMemory(self.norm_q, self.norm_k, self.norm_v, mem_dropout=self.mem_dropout, attn_thresh=0)
         else:
-            sp_mem = SpatialTemporalMemory(self.norm_q, self.norm_k, self.norm_v)
+            sp_mem = SpatialTemporalMemory(
+                self.norm_q,
+                self.norm_k,
+                self.norm_v,
+                mem_dropout=self.mem_dropout,
+                sim_thresh=0.95 if mem_sim_thresh is None else float(mem_sim_thresh),
+            )
         
         feat1, feat2, pos1, pos2, shape1, shape2 = None, None, None, None, None, None
         feat_k1, feat_k2 = None, None

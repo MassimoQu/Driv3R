@@ -18,7 +18,6 @@ from collections import defaultdict
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from driv3r.driv3r import FlowPredictor
 from driv3r.model import Spann3R
 from dust3r.losses import L21
 from driv3r.datasets import *
@@ -68,6 +67,8 @@ def get_args_parser():
     parser.add_argument('--keep_freq', default=5, type=int, help='frequence to save checkpoint in checkpoint-%d.pth')
     parser.add_argument('--print_freq', default=20, type=int, help='frequence to print infos while training')
     parser.add_argument('--alpha_c2f', type=int, default=1, help='use alpha c2f')
+    parser.add_argument('--disable_flow', action='store_true',
+                        help='disable RAFT+SAM2 flow predictor (faster finetune/debug)')
     
     # output dir 
     parser.add_argument('--output_dir', default='./output/driv3r', type=str, help="path where to save the output")
@@ -186,7 +187,12 @@ def train_one_epoch(model: torch.nn.Module, flow_predictor, criterion: torch.nn.
                 view[name] = view[name].to(device, non_blocking=True)
         
         preds, preds_all = model.forward(batch)
-        refined_dynamic_masks = flow_predictor.forward(batch, preds)
+        if flow_predictor is not None:
+            refined_dynamic_masks = flow_predictor.forward(batch, preds)
+        else:
+            refined_dynamic_masks = [
+                torch.ones_like(view['valid_mask'], dtype=torch.bool) for view in batch
+            ]
         
         loss, loss_details, loss_factor = criterion.compute_frame_loss(batch, preds_all, refined_dynamic_masks)
         loss += loss_factor     
@@ -350,6 +356,8 @@ def train(args):
     start_time = time.time()
     train_stats = test_stats = {}
     for epoch in range(args.start_epoch, args.epochs+1):
+        # No validation loop in this script, so disable best-checkpoint tracking.
+        new_best = False
         
         # TODO: Save last check point
         if epoch > args.start_epoch:
@@ -369,7 +377,13 @@ def train(args):
             train_criterion.alpha = alpha_init - 0.2 * max((epoch - 0.5 * args.epochs) / (0.5 * args.epochs), 0)
             print('Update alpha to', train_criterion.alpha)
         
-        flow_predictor = FlowPredictor(sequence_length=5)
+        flow_predictor = None
+        if not args.disable_flow:
+            # FlowPredictor depends on third-party RAFT+SAM2. Import lazily so that
+            # finetuning/debug runs with `--disable_flow` do not require those deps.
+            from driv3r.driv3r import FlowPredictor
+
+            flow_predictor = FlowPredictor(sequence_length=5)
         train_stats = train_one_epoch(
             model, flow_predictor, train_criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,

@@ -15,6 +15,7 @@ class NuSceneDataset(BaseManyViewDataset):
                  sequence_length,
                  cams, 
                  depth_root,
+                 depth_mode="r3d3",
                  dynamic=False,
                  dynamic_metas=None,
                  *args,
@@ -25,6 +26,7 @@ class NuSceneDataset(BaseManyViewDataset):
         self.sequence_length = sequence_length
         self.cams = cams
         self.depth_root = depth_root
+        self.depth_mode = depth_mode
         self.dynamic = dynamic
         self.dynamic_metas = dynamic_metas
         self.dynamic_scene_list = []
@@ -141,34 +143,67 @@ class NuSceneDataset(BaseManyViewDataset):
 
             pcd_l = np.fromfile(view["pcd"][0], dtype=np.float32)
             pcd_l = pcd_l.reshape(-1, 5)[:, :3]
+            if pcd_l.size == 0:
+                view['pts3d'] = pts3d
+                view['valid_mask'] = valid_mask
+                new_views.append(view)
+                continue
+
             N = pcd_l.shape[0]
             ones = np.ones((N, 1), dtype=np.float32)
             pcd_l_homo = np.concatenate((pcd_l, ones), axis=-1)
 
-            l2w_matrix = view["lidar_pose"][0].numpy()
-            c2w_matrix = view["camera_pose"][0].numpy()
+            l2w_matrix = view["lidar_pose"][0].cpu().numpy()
+            c2w_matrix = view["camera_pose"][0].cpu().numpy()
             l2c_matrix = np.linalg.inv(c2w_matrix) @ l2w_matrix
 
             pcd_c_homo = (l2c_matrix @ pcd_l_homo.T).T
-            pcd_w_homo = (l2w_matrix @ pcd_l_homo.T).T 
-            z_mask = pcd_c_homo[:, 2] > 0
+            z = pcd_c_homo[:, 2]
 
-            K = np.eye(4, 4, dtype=np.float32)
-            K[:3, :3] = view['camera_intrinsics']
-            pcd_pixel_homo = (K @ pcd_c_homo.T).T
-            pcd_pixel_homo[:, 0] /= (pcd_pixel_homo[:, 2] + 1e-7)
-            pcd_pixel_homo[:, 1] /= (pcd_pixel_homo[:, 2] + 1e-7)
-            pcd_pixel = pcd_pixel_homo[:, :2].astype(np.int32)
-            xy_mask = (pcd_pixel[:, 0] >= 0) & (pcd_pixel[:, 0] < w) & (pcd_pixel[:, 1] >= 0) & (pcd_pixel[:, 1] < h)
-            
-            valid_point_mask = xy_mask & z_mask
-            valid_lidar_pts = pcd_w_homo[valid_point_mask][:, :3]
-            valid_pcd_pixel = torch.tensor(pcd_pixel[valid_point_mask], dtype=torch.long, device=device)
+            K3 = view['camera_intrinsics']
+            if isinstance(K3, torch.Tensor):
+                K3 = K3.cpu().numpy()
+            if K3.ndim == 3:
+                K3 = K3[0]
+            fx, fy = float(K3[0, 0]), float(K3[1, 1])
+            cx, cy = float(K3[0, 2]), float(K3[1, 2])
 
-            y_indices = valid_pcd_pixel[:, 1]
-            x_indices = valid_pcd_pixel[:, 0]
-            pts3d[:, y_indices, x_indices, :] = torch.tensor(valid_lidar_pts, dtype=torch.float32, device=device)
-            valid_mask[:, y_indices, x_indices] = True
+            z_valid = np.isfinite(z) & (z > 1e-6)
+            if not np.any(z_valid):
+                view['pts3d'] = pts3d
+                view['valid_mask'] = valid_mask
+                new_views.append(view)
+                continue
+
+            pcd_c = pcd_c_homo[z_valid]
+            z = z[z_valid]
+            u = (pcd_c[:, 0] * fx / z + cx).astype(np.int32)
+            v = (pcd_c[:, 1] * fy / z + cy).astype(np.int32)
+
+            xy_valid = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+            u = u[xy_valid]
+            v = v[xy_valid]
+            z = z[xy_valid]
+
+            if z.size > 0:
+                idx = v * w + u
+                depth = np.full((h * w,), np.inf, dtype=np.float32)
+                np.minimum.at(depth, idx, z.astype(np.float32))
+                depth = depth.reshape(h, w)
+                mask = np.isfinite(depth)
+
+                ys, xs = np.where(mask)
+                depth_vals = depth[ys, xs]
+
+                x_cam = (xs - cx) * depth_vals / fx
+                y_cam = (ys - cy) * depth_vals / fy
+                pts_cam = np.stack([x_cam, y_cam, depth_vals, np.ones_like(depth_vals)], axis=1)
+                pts_world = (c2w_matrix @ pts_cam.T).T[:, :3]
+
+                ys_t = torch.tensor(ys, dtype=torch.long, device=device)
+                xs_t = torch.tensor(xs, dtype=torch.long, device=device)
+                pts3d[:, ys_t, xs_t, :] = torch.tensor(pts_world, dtype=torch.float32, device=device)
+                valid_mask[:, ys_t, xs_t] = True
 
             view['pts3d'] = pts3d
             view['valid_mask'] = valid_mask
@@ -181,6 +216,9 @@ class NuSceneDataset(BaseManyViewDataset):
         h, w, _ = image_size
         pcd_l = np.fromfile(sample_meta["pcd"], dtype=np.float32)
         pcd_l = pcd_l.reshape(-1, 5)[:, :3]
+        if pcd_l.size == 0:
+            return np.zeros((h, w), dtype=np.float32)
+
         N = pcd_l.shape[0]
         ones = np.ones((N, 1), dtype=np.float32)
         pcd_l_homo = np.concatenate((pcd_l, ones), axis=-1)
@@ -191,18 +229,32 @@ class NuSceneDataset(BaseManyViewDataset):
 
         pcd_c_homo = (l2c_matrix @ pcd_l_homo.T).T
 
-        K = np.eye(4, 4, dtype=np.float32)
-        K[:3, :3] = sample_meta['camera_intrinsics']
-        pcd_pixel_homo = (K @ pcd_c_homo.T).T
-        pcd_pixel_homo[:, 0] /= (pcd_pixel_homo[:, 2] + 1e-7)
-        pcd_pixel_homo[:, 1] /= (pcd_pixel_homo[:, 2] + 1e-7)
-        pcd_pixel = pcd_pixel_homo[:, :2].astype(np.int32)
-        x, y = pcd_pixel.T
+        z = pcd_c_homo[:, 2]
+        K3 = sample_meta['camera_intrinsics']
+        fx, fy = float(K3[0, 0]), float(K3[1, 1])
+        cx, cy = float(K3[0, 2]), float(K3[1, 2])
 
-        depth_map = np.zeros((h, w), dtype=np.float32)
-        depth_map[y.clip(min=0, max=h-1), x.clip(min=0, max=w-1)] = pcd_c_homo[:, 2]
+        z_valid = np.isfinite(z) & (z > 1e-6)
+        if not np.any(z_valid):
+            return np.zeros((h, w), dtype=np.float32)
 
-        return depth_map
+        pcd_c = pcd_c_homo[z_valid]
+        z = z[z_valid]
+        u = (pcd_c[:, 0] * fx / z + cx).astype(np.int32)
+        v = (pcd_c[:, 1] * fy / z + cy).astype(np.int32)
+
+        valid = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        u = u[valid]
+        v = v[valid]
+        z = z[valid]
+
+        depth = np.full((h * w,), np.inf, dtype=np.float32)
+        if z.size > 0:
+            idx = v * w + u
+            np.minimum.at(depth, idx, z.astype(np.float32))
+        depth = depth.reshape(h, w)
+        depth[np.isinf(depth)] = 0.0
+        return depth
     
     def get_r3d3_depth_map(self, 
                            meta,
@@ -239,12 +291,25 @@ class NuSceneDataset(BaseManyViewDataset):
         for frame_meta in video_frames:
             rgb_image = imread_cv2(frame_meta["img"])
             intrinsics = frame_meta['camera_intrinsics'].astype(np.float32)
-            depthmap = self.get_r3d3_depth_map(
-                meta=frame_meta, 
-                true_image_shape=rgb_image.shape, 
-                resolution=resolution,
-                nus_intri=intrinsics
-            )
+            frame_meta_local = dict(frame_meta)
+            frame_meta_local["camera_pose"] = frame_meta["cam_poses"]
+
+            if self.depth_mode in ("none", "zeros"):
+                # Depthmap is not used by Driv3R inference and is often overridden by load_lidar_pts()
+                # during evaluation/visualization. Returning zeros here avoids expensive lidar projection
+                # or missing R3D3 files when we only need images + poses.
+                depthmap = np.zeros(rgb_image.shape[:2], dtype=np.float32)
+            elif self.depth_mode == "r3d3":
+                depthmap = self.get_r3d3_depth_map(
+                    meta=frame_meta, 
+                    true_image_shape=rgb_image.shape, 
+                    resolution=resolution,
+                    nus_intri=intrinsics
+                )
+            elif self.depth_mode == "lidar":
+                depthmap = self.get_depth_map_via_lidar(frame_meta_local, rgb_image.shape)
+            else:
+                raise NotImplementedError(f"Unsupported depth_mode: {self.depth_mode}")
             
             # split into two frames, left and right
             if self.dynamic:
