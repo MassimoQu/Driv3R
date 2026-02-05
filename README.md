@@ -1,4 +1,7 @@
 # Driv3R: Learning Dense 4D Reconstruction for Autonomous Driving
+> Project: coopVGGT | Role: Baseline 3D reconstruction (OPV2V) | Status: active
+> Primary docs: vggt_series_4_coop/docs/project_overview.md
+
 
 Check out our [Large Driving Model](https://github.com/wzzheng/LDM/) Series!
 
